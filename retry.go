@@ -27,7 +27,7 @@ type actionConfig struct {
 }
 
 type actionImpl struct {
-	f       func() error
+	f       func(ctx context.Context) error
 	backoff BackoffStrategy
 	times   TimesStrategy
 	done    chan bool
@@ -41,16 +41,16 @@ type actionImpl struct {
 type Option func(action *actionImpl)
 
 // New create a new action object for retry
-func New(f func() error, options ...Option) Action {
+func New(f func(ctx context.Context) error, options ...Option) Action {
 	return initWithOptions(context.Background(), f, options...)
 }
 
 // NewWitContext create a new action object for retry with ctx
-func NewWitContext(ctx context.Context, f func() error, options ...Option) Action {
+func NewWitContext(ctx context.Context, f func(ctx context.Context) error, options ...Option) Action {
 	return initWithOptions(ctx, f, options...)
 }
 
-func initWithOptions(ctx context.Context, f func() error, options ...Option) *actionImpl {
+func initWithOptions(ctx context.Context, f func(ctx context.Context) error, options ...Option) *actionImpl {
 
 	ctx2, cancel := context.WithCancel(context.Background())
 
@@ -78,21 +78,43 @@ func initWithOptions(ctx context.Context, f func() error, options ...Option) *ac
 
 func (action *actionImpl) Do() <-chan bool {
 
-	go action.once.Do(action.doAction)
+	action.once.Do(func() {
+		go action.doAction()
+	})
 
 	return action.done
 }
 
 func (action *actionImpl) doAction() {
+
+	ctx, cancel := context.WithCancel(action.ctx)
+	defer cancel()
+
 	for i := 0; action.times.Next(i); i++ {
-		if err := action.f(); err != nil {
+		if err := action.f(ctx); err != nil {
 			action.errors <- err
-			if action.backoff.Next(action.ctx) {
+
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			if action.backoff.Next(ctx) {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
 				continue
+			} else {
+				action.done <- false
+				return
 			}
 		}
 
 		action.done <- true
+		return
 	}
 
 	action.done <- false
